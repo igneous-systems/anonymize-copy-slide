@@ -32,11 +32,12 @@ import string
 import time
 import imghdr
 import struct
+import io
 import sys
-# import numpy as np
-import os
-# from PIL import Image
+import openslide
+import hashlib
 import argparse
+import re
 
 PROG_DESCRIPTION = '''
 Delete the slide label from an MRXS, NDPI, or SVS whole-slide image.
@@ -69,8 +70,10 @@ UTF8_BOM = '\xef\xbb\xbf'
 MRXS_HIERARCHICAL = 'HIERARCHICAL'
 MRXS_NONHIER_ROOT_OFFSET = 41
 
+
 class UnrecognizedFile(Exception):
     pass
+
 
 class TiffFile(file):
     def __init__(self, path):
@@ -108,14 +111,12 @@ class TiffFile(file):
                 break
             self.seek(directory_offset)
             directory = TiffDirectory(self, len(self.directories),
-                    in_pointer_offset)
+                                      in_pointer_offset)
             if not self.directories and not self._bigtiff:
                 # Check for NDPI.  Because we don't know we have an NDPI file
                 # until after reading the first directory, we will choke if
                 # the first directory is beyond 4 GB.
                 if NDPI_MAGIC in directory.entries:
-                    if DEBUG:
-                        print('Enabling NDPI mode.')
                     self._ndpi = True
             self.directories.append(directory)
         if not self.directories:
@@ -191,30 +192,24 @@ class TiffDirectory(object):
                 self._fh.seek(offset)
             self._fh.write('\0' * length)
 
+        # Remove macro image
+        start = self._fh.tell()
+        self._fh.seek(-1, 2)
+        length = self._fh.tell() - start
+        self._fh.seek(start)
+        self._fh.write('\0' * length)
+
         # Remove directory
         self._fh.seek(self._out_pointer_offset)
         out_pointer = self._fh.read_fmt('D')
         self._fh.seek(self._in_pointer_offset)
         self._fh.write_fmt('D', out_pointer)
 
-    def delete_macro(self):
-        # Get strip offsets/lengths
-        try:
-            offsets = self.entries[STRIP_OFFSETS].value()
-            lengths = self.entries[STRIP_BYTE_COUNTS].value()
-        except KeyError:
-            raise IOError('Directory is not stripped')
-
-        # Wipe strips
-        tot_length = sum(lengths)
-        self._fh.seek(self._fh.tell()-tot_length)
-        self._fh.write('\0' * tot_length)
-
 class TiffEntry(object):
     def __init__(self, fh):
         self.start = fh.tell()
         self.tag, self.type, self.count, self.value_offset = \
-                fh.read_fmt('HHZZ')
+            fh.read_fmt('HHZZ')
         self._fh = fh
 
     def value(self):
@@ -250,12 +245,19 @@ class TiffEntry(object):
             split_items = ''.join(items[:-1]).split('|')
             for item in split_items:
                 if item.startswith('Filename = '):
-                    self._fh.seek(start_props + char_count + len('Filename = '))
+                    self._fh.seek(start_props + char_count +
+                                  len('Filename = '))
                     self._fh.write('0'*(len(item) - len('Filename = ')))
 
                 elif item.startswith('ImageID = '):
                     self._fh.seek(start_props + char_count + len('ImageID = '))
                     self._fh.write('0'*(len(item) - len('ImageID = ')))
+                    
+                elif item.startswith('ScanScope ID = '):
+                    itemparts = item.split(' = ')
+                    scanner = re.sub('[A-z]', '@', itemparts[1])
+                    self._fh.seek(start_props + char_count + len('ScanScope ID = '))
+                    self._fh.write(scanner)
 
                 char_count += len(item) + 1
             items = '|'.join(split_items)
@@ -263,11 +265,12 @@ class TiffEntry(object):
 
         except:
             if length <= self._fh.fmt_size('Z'):
-            # Inline value
+                # Inline value
                 self._fh.seek(self.start + self._fh.fmt_size('HHZ'))
             else:
                 # Out-of-line value
-                self._fh.seek(self._fh.near_pointer(self.start, self.value_offset))
+                self._fh.seek(self._fh.near_pointer(
+                    self.start, self.value_offset))
 
             start_props = self._fh.tell()
             items = self._fh.read_fmt(fmt, force_list=True)
@@ -301,10 +304,10 @@ class MrxsFile(object):
 
         # Get file paths
         self._indexfile = os.path.join(dirname,
-                self._dat.get(MRXS_HIERARCHICAL, 'INDEXFILE'))
+                                       self._dat.get(MRXS_HIERARCHICAL, 'INDEXFILE'))
         self._datafiles = [os.path.join(dirname,
-                self._dat.get('DATAFILE', 'FILE_%d' % i))
-                for i in range(self._dat.getint('DATAFILE', 'FILE_COUNT'))]
+                                        self._dat.get('DATAFILE', 'FILE_%d' % i))
+                           for i in range(self._dat.getint('DATAFILE', 'FILE_COUNT'))]
 
         # Build levels
         self._make_levels()
@@ -315,10 +318,10 @@ class MrxsFile(object):
         layer_count = self._dat.getint(MRXS_HIERARCHICAL, 'NONHIER_COUNT')
         for layer_id in range(layer_count):
             level_count = self._dat.getint(MRXS_HIERARCHICAL,
-                    'NONHIER_%d_COUNT' % layer_id)
+                                           'NONHIER_%d_COUNT' % layer_id)
             for level_id in range(level_count):
                 level = MrxsNonHierLevel(self._dat, layer_id, level_id,
-                        len(self._level_list))
+                                         len(self._level_list))
                 self._levels[(level.layer_name, level.name)] = level
                 self._level_list.append(level)
 
@@ -365,11 +368,6 @@ class MrxsFile(object):
         with open(path, 'r+b') as fh:
             fh.seek(0, 2)
             do_truncate = (fh.tell() == offset + length)
-            if DEBUG:
-                if do_truncate:
-                    print 'Truncating', path, 'to', offset
-                else:
-                    print 'Zeroing', path, 'at', offset, 'for', length
             fh.seek(offset)
             buf = fh.read(len(JPEG_SOI))
             if buf != JPEG_SOI:
@@ -381,8 +379,6 @@ class MrxsFile(object):
                 fh.write('\0' * length)
 
     def _delete_index_record(self, record):
-        if DEBUG:
-            print 'Deleting record', record
         with open(self._indexfile, 'r+b') as fh:
             entries_to_move = len(self._level_list) - record - 1
             if entries_to_move == 0:
@@ -408,36 +404,23 @@ class MrxsFile(object):
 
     def _rename_section(self, old, new):
         if self._dat.has_section(old):
-            if DEBUG:
-                print '[%s] -> [%s]' % (old, new)
             self._dat.add_section(new)
             for k, v in self._dat.items(old):
                 self._dat.set(new, k, v)
             self._dat.remove_section(old)
-        elif DEBUG:
-            print '[%s] does not exist' % old
 
     def _delete_section(self, section):
-        if DEBUG:
-            print 'Deleting [%s]' % section
         self._dat.remove_section(section)
 
     def _set_key(self, section, key, value):
-        if DEBUG:
-            prev = self._dat.get(section, key)
-            print '[%s] %s: %s -> %s' % (section, key, prev, value)
         self._dat.set(section, key, value)
 
     def _rename_key(self, section, old, new):
-        if DEBUG:
-            print '[%s] %s -> %s' % (section, old, new)
         v = self._dat.get(section, old)
         self._dat.remove_option(section, old)
         self._dat.set(section, new, v)
 
     def _delete_key(self, section, key):
-        if DEBUG:
-            print 'Deleting [%s] %s' % (section, key)
         self._dat.remove_option(section, key)
 
     def _write(self):
@@ -472,10 +455,10 @@ class MrxsFile(object):
                 break
             for k in self._hier_keys_for_level(cur_level):
                 new_k = k.replace(cur_level.key_prefix,
-                        prev_level.key_prefix, 1)
+                                  prev_level.key_prefix, 1)
                 self._rename_key(MRXS_HIERARCHICAL, k, new_k)
             self._set_key(MRXS_HIERARCHICAL, prev_level.section_key,
-                    prev_level.section)
+                          prev_level.section)
             self._rename_section(cur_level.section, prev_level.section)
             prev_level = cur_level
 
@@ -490,19 +473,17 @@ class MrxsFile(object):
         # Refresh metadata
         self._make_levels()
 
-
 class MrxsNonHierLevel(object):
     def __init__(self, dat, layer_id, level_id, record):
         self.layer_id = layer_id
         self.id = level_id
         self.record = record
         self.layer_name = dat.get(MRXS_HIERARCHICAL,
-                'NONHIER_%d_NAME' % layer_id)
+                                  'NONHIER_%d_NAME' % layer_id)
         self.key_prefix = 'NONHIER_%d_VAL_%d' % (layer_id, level_id)
         self.name = dat.get(MRXS_HIERARCHICAL, self.key_prefix)
         self.section_key = self.key_prefix + '_SECTION'
         self.section = dat.get(MRXS_HIERARCHICAL, self.section_key)
-
 
 def accept(filename, format):
     if DEBUG:
@@ -519,26 +500,13 @@ def do_aperio_svs(filename):
             raise UnrecognizedFile
         accept(filename, 'SVS')
 
-        macro_found, label_found = False, False
         # Find and delete label
         count = 0
         for directory in fh.directories:
             count += 1
             lines = directory.entries[IMAGE_DESCRIPTION].value().splitlines()
             if len(lines) >= 2 and lines[1].startswith('label '):
-                label_found = True
                 directory.delete(expected_prefix=LZW_CLEARCODE)
-
-            elif len(lines) >= 2 and lines[1].startswith('macro '):
-                macro_found = True
-                directory.delete_macro()
-
-            # elif len(lines) >= 2:
-            #     if STRIP_OFFSETS in directory.entries.keys() and STRIP_BYTE_COUNTS in directory.entries.keys():
-            #         directory.overwrite_props(expected_prefix=JPEG)
-
-            if macro_found and label_found:
-                break
         else:
             raise IOError("No label in SVS file")
 
@@ -557,7 +525,6 @@ def do_hamamatsu_ndpi(filename):
         else:
             raise IOError("No label in NDPI file")
 
-
 def do_3dhistech_mrxs(filename):
     mrxs = MrxsFile(filename)
     try:
@@ -571,14 +538,17 @@ format_handlers = [
     do_3dhistech_mrxs,
 ]
 
+def get_hash(filename):
+    slide = openslide.OpenSlide(filename)
+    return hashlib.md5(slide.associated_images['thumbnail'].tobytes()).hexdigest()
+
 def _main():
     global DEBUG
 
-    start = time.time()
     parser = OptionParser(usage='%prog [options] file [file...]',
-            description=PROG_DESCRIPTION, version=PROG_VERSION)
+                          description=PROG_DESCRIPTION, version=PROG_VERSION)
     parser.add_option('-d', '--debug', action='store_true',
-            help='show debugging information')
+                      help='show debugging information')
     opts, args = parser.parse_args()
     if not args:
         parser.error('specify a file')
@@ -592,9 +562,13 @@ def _main():
     else:
         filenames = args
 
+    hashes = []
+    for filename in filenames:
+        hashes.append(get_hash(filename))
+    print(hashes)
+
     exit_code = 0
     file_count = 0
-    tot_files = len(filenames)
     for filename in filenames:
         try:
             for handler in format_handlers:
@@ -605,15 +579,15 @@ def _main():
                     pass
             else:
                 raise IOError('Unrecognized file type')
-            file_count += 1
+
         except Exception, e:
             if DEBUG:
                 raise
-            # # Uncomment line below to print our debugging statements/errors
-            # print >>sys.stderr, '%s: %s' % (filename, str(e))
-            exit_code = 1
-    end = time.time()
-    # print('time elapsed: ' + str(end-start))
+        file_count += 1
+        # # Uncomment line below to print our debugging statements/errors
+        # print >>sys.stderr, '%s: %s' % (filename, str(e))
+        exit_code = 1
+
     # print('files processed: ' + str(file_count))
     sys.exit(exit_code)
 
